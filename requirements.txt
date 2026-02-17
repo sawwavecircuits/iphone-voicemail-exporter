@@ -1,0 +1,4 @@
+# Required ONLY for encrypted backup support.
+# The tool works without these packages for unencrypted backups.
+iphone-backup-decrypt>=0.9.0
+pycryptodome>=3.9.0
