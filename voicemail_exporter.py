@@ -66,7 +66,17 @@ def find_backups(custom_path=None):
         print("Use --backup-dir to specify a custom path.", file=sys.stderr)
         sys.exit(1)
 
-    candidates = [d for d in base.iterdir() if d.is_dir() and (d / "Manifest.plist").exists()]
+    try:
+        candidates = [d for d in base.iterdir() if d.is_dir() and (d / "Manifest.plist").exists()]
+    except PermissionError:
+        print(f"Error: Permission denied accessing: {base}", file=sys.stderr)
+        print("macOS is blocking access to the iPhone backup folder.", file=sys.stderr)
+        print("To fix this, grant Full Disk Access to your terminal app:", file=sys.stderr)
+        print("  macOS 13+: System Settings → Privacy & Security → Full Disk Access", file=sys.stderr)
+        print("  macOS 12-: System Preferences → Security & Privacy → Full Disk Access", file=sys.stderr)
+        print("Add your terminal app (Terminal, iTerm2, VS Code, etc.), then quit", file=sys.stderr)
+        print("and relaunch the terminal app before running this script again.", file=sys.stderr)
+        sys.exit(1)
     if not candidates:
         print(f"Error: No iPhone backups found in: {base}", file=sys.stderr)
         sys.exit(1)
