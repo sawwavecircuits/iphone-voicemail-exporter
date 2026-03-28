@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# R
+.Rhistory
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.spec
+.coverage
+htmlcov/
+
+# Exported voicemails
+voicemails_export/
