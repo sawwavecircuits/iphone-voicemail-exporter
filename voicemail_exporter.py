@@ -172,7 +172,7 @@ def open_manifest_db(backup_path, password=None):
         tmp_dir = tempfile.mkdtemp(prefix="voicemail_export_")
         backup = EncryptedBackup(backup_directory=str(backup_path), passphrase=password)
         manifest_db_path = Path(tmp_dir) / "Manifest.db"
-        backup.extract_manifest_db(output_folder=tmp_dir)
+        backup.save_manifest_file(output_filename=manifest_db_path)
         conn = sqlite3.connect(str(manifest_db_path))
         return conn, tmp_dir, backup
 
@@ -230,16 +230,26 @@ def find_voicemail_db(manifest_conn):
     return None, None
 
 
-def extract_file(backup_path, file_id, dest_path, encrypted_backup=None):
+def extract_file(backup_path, file_id, dest_path, encrypted_backup=None,
+                 relative_path=None):
     """Copy a backup file to dest_path.
 
     For unencrypted: reads from <backup>/<first2>/<fileID>.
-    For encrypted: uses the EncryptedBackup object.
+    For encrypted: decrypts via the EncryptedBackup object, which addresses
+    files by relativePath rather than fileID.
     """
     if encrypted_backup is not None:
-        # iphone-backup-decrypt provides extract_file(relative_path, output_folder)
-        # but we need file_id-based access; use internal method if needed
-        raise NotImplementedError("Per-file encrypted extraction not yet supported here.")
+        if not relative_path:
+            return False
+        try:
+            encrypted_backup.extract_file(
+                relative_path=relative_path,
+                domain_like="HomeDomain",
+                output_filename=str(dest_path),
+            )
+        except FileNotFoundError:
+            return False
+        return True
 
     src = backup_path / file_id[:2] / file_id
     if not src.exists():
@@ -407,7 +417,8 @@ def export_voicemails(matched, output_dir, backup_path, convert_format=None,
             # Extract to temp first, then convert
             with tempfile.NamedTemporaryFile(suffix=".amr", delete=False) as tmp:
                 tmp_path = Path(tmp.name)
-            success = extract_file(backup_path, file_id, tmp_path, encrypted_backup)
+            success = extract_file(backup_path, file_id, tmp_path, encrypted_backup,
+                                   entry.get("relative_path"))
             if success:
                 ok = convert_audio(tmp_path, out_path, convert_format)
                 if not ok:
@@ -423,7 +434,8 @@ def export_voicemails(matched, output_dir, backup_path, convert_format=None,
         else:
             out_name = make_output_filename(entry, i, fmt="amr")
             out_path = output_dir / out_name
-            success = extract_file(backup_path, file_id, out_path, encrypted_backup)
+            success = extract_file(backup_path, file_id, out_path, encrypted_backup,
+                                   entry.get("relative_path"))
             entry["output_file"] = out_name if success else ""
 
         exported.append(entry)
@@ -554,7 +566,8 @@ Examples:
         if vm_db_file_id:
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_db:
                 tmp_db_path = Path(tmp_db.name)
-            success = extract_file(backup_path, vm_db_file_id, tmp_db_path, enc_backup)
+            success = extract_file(backup_path, vm_db_file_id, tmp_db_path, enc_backup,
+                                   vm_db_rel_path)
             if success:
                 metadata = parse_voicemail_metadata(tmp_db_path)
                 print(f"Found {len(metadata)} voicemail metadata record(s)")
