@@ -221,6 +221,28 @@ class TestManifestDb:
         assert file_id == "ccddee003333333333333333333333333333333333"
         assert rel_path == "Library/Voicemail/voicemail.db"
 
+    def test_find_voicemail_transcripts(self, mock_backup):
+        file_id = "ddeeff0044444444444444444444444444444444"
+        conn = sqlite3.connect(str(mock_backup / "Manifest.db"))
+        conn.execute(
+            "INSERT INTO Files VALUES (?,?,?,?,?)",
+            (file_id, "HomeDomain", "Library/Voicemail/1.transcript", 1, None),
+        )
+        conn.commit()
+        assert ve.find_voicemail_transcripts(conn) == {"1": file_id}
+        conn.close()
+
+    def test_find_contacts_db(self, mock_backup):
+        file_id = "eeff001155555555555555555555555555555555"
+        conn = sqlite3.connect(str(mock_backup / "Manifest.db"))
+        conn.execute(
+            "INSERT INTO Files VALUES (?,?,?,?,?)",
+            (file_id, "HomeDomain", "Library/AddressBook/AddressBook.sqlitedb", 1, None),
+        )
+        conn.commit()
+        assert ve.find_contacts_db(conn) == file_id
+        conn.close()
+
     def test_find_voicemail_files_empty_backup(self, tmp_dir):
         empty_db = tmp_dir / "empty_manifest.db"
         conn = sqlite3.connect(str(empty_db))
@@ -286,6 +308,66 @@ class TestParseVoicemailMetadata:
         assert "2024-03-15" in row2["date_str"]
 
 
+class TestParseVoicemailTranscript:
+    def test_reads_nskeyedarchiver_transcription(self, tmp_dir):
+        transcript_path = tmp_dir / "1.transcript"
+        archive = {
+            "$version": 100000,
+            "$archiver": "NSKeyedArchiver",
+            "$top": {"root": plistlib.UID(1)},
+            "$objects": [
+                "$null",
+                {"transcriptionString": plistlib.UID(2)},
+                "Please call me back.",
+            ],
+        }
+        transcript_path.write_bytes(b"synthetic archive")
+        with patch("voicemail_exporter.plistlib.load", return_value=archive):
+            assert ve.parse_voicemail_transcript(transcript_path) == "Please call me back."
+
+    def test_reads_nsstring_wrapped_transcription(self, tmp_dir):
+        transcript_path = tmp_dir / "1.transcript"
+        archive = {
+            "$version": 100000,
+            "$archiver": "NSKeyedArchiver",
+            "$top": {"root": plistlib.UID(1)},
+            "$objects": [
+                "$null",
+                {"transcriptionString": plistlib.UID(2)},
+                {"NS.string": plistlib.UID(3)},
+                "Please call me back.",
+            ],
+        }
+        transcript_path.write_bytes(b"synthetic archive")
+        with patch("voicemail_exporter.plistlib.load", return_value=archive):
+            assert ve.parse_voicemail_transcript(transcript_path) == "Please call me back."
+
+    def test_rejects_archive_without_transcription(self, tmp_dir):
+        transcript_path = tmp_dir / "1.transcript"
+        transcript_path.write_bytes(plistlib.dumps({"$objects": ["$null"], "$top": {}}))
+        with pytest.raises(ValueError, match="no transcription"):
+            ve.parse_voicemail_transcript(transcript_path)
+
+
+class TestParseContactNames:
+    def test_maps_normalized_phone_numbers_to_contact_names(self, tmp_dir):
+        address_book_path = tmp_dir / "AddressBook.sqlitedb"
+        conn = sqlite3.connect(str(address_book_path))
+        conn.execute(
+            "CREATE TABLE ABPerson (ROWID INTEGER PRIMARY KEY, First TEXT, Last TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE ABMultiValue (UID INTEGER PRIMARY KEY, record_id INTEGER, "
+            "property INTEGER, value TEXT)"
+        )
+        conn.execute("INSERT INTO ABPerson VALUES (1, 'Alex', 'Example')")
+        conn.execute("INSERT INTO ABMultiValue VALUES (1, 1, 3, '+1 (555) 123-4567')")
+        conn.commit()
+        conn.close()
+
+        assert ve.parse_contact_names(address_book_path) == {"15551234567": "Alex Example"}
+
+
 # ---------------------------------------------------------------------------
 # Test: matching
 # ---------------------------------------------------------------------------
@@ -341,6 +423,14 @@ class TestMakeOutputFilename:
         }
         name = ve.make_output_filename(entry, 1)
         assert name == "001_2024-03-15_+15551234567.amr"
+
+    def test_uses_contact_name_instead_of_phone_number(self):
+        entry = {
+            "date_str": "2024-03-15 10:22:00 UTC",
+            "sender": "+15551234567",
+            "contact_name": "Alex Example",
+        }
+        assert ve.make_output_filename(entry, 1) == "001_2024-03-15_Alex_Example.amr"
 
     def test_unknown_sender(self):
         entry = {"date_str": "", "sender": None, "callback_num": None}
@@ -419,7 +509,8 @@ class TestExportVoicemails:
             rows = list(csv.DictReader(f))
         assert len(rows) == len(exported)
         # Verify expected columns exist
-        for col in ("index", "output_file", "sender", "date", "duration"):
+        for col in ("index", "output_file", "sender", "date", "duration",
+                    "contact_name", "transcript"):
             assert col in rows[0]
 
     def test_csv_has_correct_sender(self, mock_backup, tmp_dir):

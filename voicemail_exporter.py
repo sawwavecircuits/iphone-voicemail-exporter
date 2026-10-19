@@ -14,6 +14,7 @@ import csv
 import os
 import platform
 import plistlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -230,6 +231,37 @@ def find_voicemail_db(manifest_conn):
     return None, None
 
 
+def find_voicemail_transcripts(manifest_conn):
+    """Find transcript sidecars keyed by the voicemail ROWID in their filename."""
+    cursor = manifest_conn.cursor()
+    cursor.execute(
+        """
+        SELECT fileID, relativePath
+        FROM Files
+        WHERE domain = 'HomeDomain'
+          AND relativePath LIKE 'Library/Voicemail/%.transcript'
+        ORDER BY relativePath
+        """
+    )
+    return {Path(rel_path).stem: file_id for file_id, rel_path in cursor.fetchall()}
+
+
+def find_contacts_db(manifest_conn):
+    """Return the file ID for the iPhone AddressBook database, if present."""
+    cursor = manifest_conn.cursor()
+    cursor.execute(
+        """
+        SELECT fileID
+        FROM Files
+        WHERE domain = 'HomeDomain'
+          AND relativePath = 'Library/AddressBook/AddressBook.sqlitedb'
+        LIMIT 1
+        """
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
 def extract_file(backup_path, file_id, dest_path, encrypted_backup=None):
     """Copy a backup file to dest_path.
 
@@ -303,6 +335,130 @@ def parse_voicemail_metadata(voicemail_db_path):
     return results
 
 
+def parse_voicemail_transcript(transcript_path):
+    """Decode the transcription text from an iOS NSKeyedArchiver plist."""
+    with open(transcript_path, "rb") as transcript_file:
+        archive = plistlib.load(transcript_file)
+
+    if isinstance(archive, str):
+        return archive.strip()
+    if not isinstance(archive, dict) or not isinstance(archive.get("$objects"), list):
+        raise ValueError("Unsupported voicemail transcript archive")
+
+    objects = archive["$objects"]
+
+    def resolve(value):
+        while isinstance(value, plistlib.UID):
+            index = value.data
+            if index >= len(objects):
+                raise ValueError("Transcript archive contains an invalid object reference")
+            value = objects[index]
+        return value
+
+    root = resolve(archive.get("$top", {}).get("root"))
+    candidates = [root] if isinstance(root, dict) else []
+    candidates.extend(obj for obj in objects if isinstance(obj, dict))
+    for obj in candidates:
+        text = obj.get("transcriptionString")
+        if text is not None:
+            text = resolve(text)
+            if isinstance(text, dict) and "NS.string" in text:
+                text = resolve(text["NS.string"])
+            if isinstance(text, str):
+                return text.strip()
+
+    raise ValueError("Transcript archive contains no transcription text")
+
+
+def read_voicemail_transcripts(manifest_conn, backup_path, encrypted_backup=None):
+    """Read available transcripts keyed by the voicemail ROWID."""
+    transcripts = {}
+    for rowid, file_id in find_voicemail_transcripts(manifest_conn).items():
+        with tempfile.NamedTemporaryFile(suffix=".transcript", delete=False) as tmp:
+            transcript_path = Path(tmp.name)
+        try:
+            if not extract_file(backup_path, file_id, transcript_path, encrypted_backup):
+                print(f"Warning: Could not extract transcript for voicemail {rowid}.",
+                      file=sys.stderr)
+                continue
+            try:
+                transcripts[rowid] = parse_voicemail_transcript(transcript_path)
+            except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+                print(f"Warning: Could not read transcript for voicemail {rowid}: {exc}",
+                      file=sys.stderr)
+        finally:
+            transcript_path.unlink(missing_ok=True)
+    return transcripts
+
+
+def normalize_phone_number(number):
+    """Normalize a phone number to digits for exact contact matching."""
+    return re.sub(r"\D", "", str(number or ""))
+
+
+def parse_contact_names(address_book_path):
+    """Map normalized phone numbers to names from an iPhone AddressBook DB."""
+    conn = sqlite3.connect(str(address_book_path))
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    person_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(ABPerson)")}
+    multivalue_columns = {
+        row["name"] for row in cursor.execute("PRAGMA table_info(ABMultiValue)")
+    }
+    required_person_columns = {"ROWID"}
+    required_multivalue_columns = {"record_id", "property", "value"}
+    if not required_person_columns <= person_columns or not required_multivalue_columns <= multivalue_columns:
+        conn.close()
+        raise ValueError("AddressBook database has an unsupported schema")
+
+    name_columns = [
+        column for column in ("DisplayName", "Prefix", "First", "Middle", "Last",
+                              "Suffix", "Organization")
+        if column in person_columns
+    ]
+    people = {}
+    if name_columns:
+        selected_columns = ", ".join(["ROWID"] + name_columns)
+        cursor.execute(f"SELECT {selected_columns} FROM ABPerson")
+        for row in cursor.fetchall():
+            display_name = row["DisplayName"] if "DisplayName" in name_columns else None
+            components = [
+                row[column] for column in ("Prefix", "First", "Middle", "Last", "Suffix")
+                if column in name_columns and row[column]
+            ]
+            name = display_name or " ".join(str(part) for part in components)
+            if not name and "Organization" in name_columns:
+                name = row["Organization"] or ""
+            people[row["ROWID"]] = str(name).strip()
+
+    names_by_number = {}
+    cursor.execute(
+        "SELECT record_id, value FROM ABMultiValue WHERE property = 3 ORDER BY UID"
+    )
+    for record_id, value in cursor.fetchall():
+        number = normalize_phone_number(value)
+        name = people.get(record_id, "")
+        if number and name:
+            names_by_number.setdefault(number, name)
+
+    conn.close()
+    return names_by_number
+
+
+def add_contact_names_and_transcripts(matched, contact_names, transcripts):
+    """Attach available contact names and transcripts to voicemail records."""
+    for entry in matched:
+        numbers = (
+            normalize_phone_number(entry.get("sender")),
+            normalize_phone_number(entry.get("callback_num")),
+        )
+        entry["contact_name"] = next(
+            (contact_names[number] for number in numbers if number in contact_names), ""
+        )
+        entry["transcript"] = transcripts.get(str(entry.get("rowid") or entry.get("filename")), "")
+    return matched
+
+
 def match_voicemails(audio_files, metadata):
     """Join audio files with metadata by ROWID / filename.
 
@@ -339,8 +495,7 @@ def make_output_filename(entry, index, fmt="amr"):
         # e.g. "2024-03-15 10:22:00 UTC" -> "2024-03-15"
         date_part = date_str.split(" ")[0]
 
-    sender = entry.get("sender") or entry.get("callback_num") or "unknown"
-    # Sanitize: keep only alphanumerics, dashes, underscores, plus
+    sender = entry.get("contact_name") or entry.get("sender") or entry.get("callback_num") or "unknown"
     safe_sender = "".join(c if c.isalnum() or c in "-_+" else "_" for c in sender)
     safe_sender = safe_sender.strip("_")[:40] or "unknown"
 
@@ -438,7 +593,7 @@ def write_csv(matched, output_dir):
 
     fieldnames = [
         "index", "output_file", "sender", "callback_num", "date",
-        "duration", "label", "rowid", "file_id",
+        "duration", "label", "contact_name", "transcript", "rowid", "file_id",
     ]
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -453,6 +608,8 @@ def write_csv(matched, output_dir):
                 "date": entry.get("date_str", ""),
                 "duration": entry.get("duration", ""),
                 "label": entry.get("label", ""),
+                "contact_name": entry.get("contact_name", ""),
+                "transcript": entry.get("transcript", ""),
                 "rowid": entry.get("rowid", ""),
                 "file_id": entry.get("file_id", ""),
             }
@@ -564,6 +721,27 @@ Examples:
 
         # Match audio with metadata
         matched = match_voicemails(audio_files, metadata)
+        transcripts = read_voicemail_transcripts(manifest_conn, backup_path, enc_backup)
+
+        contact_names = {}
+        contacts_file_id = find_contacts_db(manifest_conn)
+        if contacts_file_id:
+            with tempfile.NamedTemporaryFile(suffix=".sqlitedb", delete=False) as tmp_contacts:
+                contacts_path = Path(tmp_contacts.name)
+            try:
+                if extract_file(backup_path, contacts_file_id, contacts_path, enc_backup):
+                    try:
+                        contact_names = parse_contact_names(contacts_path)
+                    except (OSError, sqlite3.Error, ValueError) as exc:
+                        print(f"Warning: Could not read contact names: {exc}", file=sys.stderr)
+                else:
+                    print("Warning: Could not extract the contacts database.", file=sys.stderr)
+            finally:
+                contacts_path.unlink(missing_ok=True)
+
+        add_contact_names_and_transcripts(matched, contact_names, transcripts)
+        print(f"Found {sum(bool(entry['transcript']) for entry in matched)} voicemail transcript(s)")
+        print(f"Matched {sum(bool(entry['contact_name']) for entry in matched)} voicemail contact name(s)")
 
         # Determine conversion format
         convert_format = None
