@@ -6,7 +6,7 @@ Export voicemails from iPhone local backups (iTunes/Finder) to labeled audio fil
 
 - Works with **unencrypted backups** using zero extra dependencies (stdlib only)
 - Works with **encrypted backups** via `iphone-backup-decrypt`
-- Exports `.amr` files with human-readable names: `001_2024-03-15_+15551234567.amr`
+- Exports `.amr` files with human-readable names, using a matched contact name when available: `001_2024-03-15_Alex_Example.amr`
 - Converts to **MP3, WAV, or M4A** via ffmpeg
 - Generates a **`voicemails.csv`** manifest with sender, date, duration, and more
 - Auto-detects backup location on macOS, Windows, and Linux
@@ -107,6 +107,8 @@ voicemails_export/
 | date         | Voicemail date/time (UTC)                |
 | duration     | Duration in seconds                      |
 | label        | User label (if set)                      |
+| contact_name | Matched contact name (if available)      |
+| transcript   | iPhone's interpreted voicemail text (if available) |
 | rowid        | Internal voicemail.db row ID             |
 | file_id      | Backup file hash                         |
 
@@ -146,14 +148,16 @@ python -m pytest tests/ -v
 ## How It Works
 
 1. Locates the iTunes/Finder backup directory for your OS
-2. Reads `Manifest.db` to find voicemail audio files (`.amr`) and `voicemail.db`
+2. Reads `Manifest.db` to find voicemail audio files (`.amr`), transcript sidecars, `voicemail.db`, and the contacts database
 3. Extracts `voicemail.db` and parses caller info, timestamps, and duration
-4. Copies each audio file to the output directory with a descriptive filename
-5. Optionally converts `.amr` to MP3/WAV/M4A via ffmpeg
-6. Writes a `voicemails.csv` summary
+4. Matches caller numbers to saved contacts and reads available iPhone voicemail transcripts
+5. Copies each audio file to the output directory with a descriptive filename
+6. Optionally converts `.amr` to MP3/WAV/M4A via ffmpeg
+7. Writes a `voicemails.csv` summary, including contact names and transcripts when available
 
 ## Notes
 
 - Voicemail audio is stored in AMR (Adaptive Multi-Rate) format. Most media players support it; ffmpeg can convert it to any format.
+- Contact names are matched from the contacts stored in the same backup using caller phone numbers. Transcripts are included only when iOS saved a matching `.transcript` sidecar; unavailable values are left blank.
 - Deleted voicemails may still appear in the backup. Check the `flags` field in the CSV — flag `1` typically means active, `5` means deleted.
 - This tool is read-only and never modifies your backup.
